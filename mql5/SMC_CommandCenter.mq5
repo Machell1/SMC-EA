@@ -5,13 +5,14 @@
 //| DRAW-ONLY indicator. Never touches orders. Each OnTimer it reads  |
 //| a per-symbol command file the desk writes to the Common\Files     |
 //| sandbox and renders a professional dashboard panel + SMC objects  |
-//| (channel, OB/FVG/zone rectangles, EQH/EQL liquidity, BOS/CHoCH).  |
+//| (channel, OB/FVG/zone rectangles, EQH/EQL liquidity, BOS/CHoCH,   |
+//| SWEEP raid markers for the gold M15 killzone ruleset).            |
 //| Writes a per-symbol ack file back so the desk can verify from chat.|
 //| IPC mirrors TurtleModeA.mq5: FILE_COMMON, FILE_TXT|FILE_ANSI,      |
 //| atomic temp+FileMove; semicolon line format (no JSON parser).     |
 //+------------------------------------------------------------------+
 #property copyright "SMC COMMAND DESK"
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 #property indicator_chart_window
 #property indicator_plots   0
@@ -176,6 +177,8 @@ void Lbl(const string id,const int x,const int y,const string text,
 color ValueColor(const string key,const string val)
 {
    string v=val; StringToLower(v);
+   if(key=="Killzone") return (StringFind(v,"off")==0) ? C'120,126,140' : C'95,205,140';
+   if(StringFind(v,"swept")>=0)    return C'240,142,90';
    if(StringFind(v,"lockout")>=0 && StringFind(v,"none")<0) return C'240,142,90';
    if(StringFind(v,"halt")>=0 || StringFind(v,"fault")>=0)  return C'233,115,103';
    if(StringFind(v,"fail")>=0)     return C'233,115,103';
@@ -289,6 +292,20 @@ void DrawTrend(const string id,const datetime t1,const double p1,
    ObjectSetInteger(0,n,OBJPROP_HIDDEN,true);
 }
 
+void DrawArrow(const string id,const datetime t1,const double p1,const color clr)
+{
+   string n=InpObjPrefix+id;
+   if(ObjectFind(0,n)<0) ObjectCreate(0,n,OBJ_ARROW,0,t1,p1);
+   ObjectSetInteger(0,n,OBJPROP_TIME,0,t1);
+   ObjectSetDouble (0,n,OBJPROP_PRICE,0,p1);
+   ObjectSetInteger(0,n,OBJPROP_ARROWCODE,251);   // Wingdings 'x' = raid wick
+   ObjectSetInteger(0,n,OBJPROP_ANCHOR,ANCHOR_CENTER);
+   ObjectSetInteger(0,n,OBJPROP_COLOR,clr);
+   ObjectSetInteger(0,n,OBJPROP_WIDTH,1);
+   ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,n,OBJPROP_HIDDEN,true);
+}
+
 void DrawText(const string id,const datetime t1,const double p1,
               const string label,const color clr)
 {
@@ -330,6 +347,12 @@ bool RenderObject(const string &f[],const int nf)
    if(ku=="EQ"){
       if(p1<=0) return false;
       DrawHRay(id,(t1>0)?t1:CurrentBarTime(),p1,clr,STYLE_DASH); return true;
+   }
+   if(ku=="SWEEP"){
+      if(p1<=0) return false;
+      DrawArrow(id,t1,p1,clr);
+      if(label!="") DrawText(id,t1,p1,label,clr);
+      return true;
    }
    if(ku=="BOS" || ku=="CHOCH"){
       if(p1<=0) return false;

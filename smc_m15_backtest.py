@@ -25,14 +25,17 @@ POINT     = float(sys.argv[2])
 SLIP      = float(sys.argv[3])
 SPLIT_Y   = int(sys.argv[4]) if len(sys.argv) > 4 else 2025
 LABEL     = sys.argv[5] if len(sys.argv) > 5 else CSV_PATH
-MODE      = sys.argv[6] if len(sys.argv) > 6 else "doctrine"   # doctrine | scalp
+MODE      = sys.argv[6] if len(sys.argv) > 6 else "doctrine"   # doctrine | scalp | gold
 FILTERS   = set((sys.argv[7] if len(sys.argv) > 7 else "").split(",")) - {""}
 # scalp-mode filters: sess (London+NY 07-21 UTC), disp (displacement break bar),
 #                     sweep (liquidity sweep within 20 bars first), trail (BE@1R + 2xATR trail)
+# gold-mode  filters: trail (same management), nobias (drop the H4-bias alignment gate)
 
 H4_BARS   = 160     # H4 context window given to detect_setup (matches live --htf-count)
-M15_BARS  = 120     # M15 window (matches live --ltf-count)
+M15_BARS  = 224     # M15 window (matches live --ltf-count; >2 days for prior-day levels)
 PEND_BARS = 16      # pending limit validity: 16 x M15 = 4h
+if MODE == "gold":
+    PEND_BARS = 8   # killzone retrace entries must fill inside the window (2h)
 MAX_HOLD  = 96      # 24h max hold
 WARMUP    = H4_BARS * 16 + 32
 RNG_SEED  = 12345
@@ -201,7 +204,18 @@ for i in range(WARMUP, n-1):
     sh4,sl4 = sm.swings(H4[2],H4[3])
     a15= sm.atr(M15[2],M15[3],M15[4]); sh15,sl15 = sm.swings(M15[2],M15[3])
     bias = sm.structure_bias(sh4,sl4,H4[2],H4[3])
-    if MODE=="scalp":
+    if MODE=="gold":
+        sig = sm.detect_gold_m15((M15[0],M15[1],M15[2],M15[3],M15[4],a15,sh15,sl15),
+                                 c[i], bias, require_bias=("nobias" not in FILTERS),
+                                 entry_mode=("edge" if "edge" in FILTERS else
+                                             ("mkt" if "mkt" in FILTERS else "ce")),
+                                 sl_buf=(0.25 if "buf25" in FILTERS else sm.KZ_SL_BUF_ATR),
+                                 rr_min=(1.5 if "rr15" in FILTERS else sm.KZ_RR_MIN),
+                                 rr_cap=(2.0 if "cap2" in FILTERS else
+                                         (0.0 if "nocap" in FILTERS else sm.KZ_RR_CAP)),
+                                 require_pd=("nopd" not in FILTERS))
+        state = "LTF_CONFIRMED" if sig else "OBSERVE"
+    elif MODE=="scalp":
         sig = detect_scalp((M15[0],M15[1],M15[2],M15[3],M15[4],a15,sh15,sl15), c[i], bias)
         state = "LTF_CONFIRMED" if sig else "OBSERVE"
     else:

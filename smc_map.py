@@ -260,6 +260,207 @@ def liq_below_of(sl, l, a, price):
     p = eq_pool(sl, l, a, price, "low")
     return p[1] if p else (l[sl[-1]] if sl else None)
 
+# ---------- XAUUSD M15 killzone ruleset -------------------------------------
+# Research-tuned (see README "Gold M15 killzone ruleset"): the community
+# consensus for SMC on gold M15 is sweep-first + displacement MSS inside the
+# London / New York killzones, entry at the 50% of the confirmation FVG/OB
+# (consequent encroachment), stop beyond the sweep wick with an ATR buffer,
+# target the opposing liquidity pool, longs only in discount / shorts only in
+# premium of the dealing range. All levels are real OHLC values (R-invariant).
+KZ_WINDOWS      = ((7*60,  10*60),      # London open killzone 07:00-10:00 UTC
+                   (12*60+30, 16*60))   # NY killzone 12:30-16:00 UTC
+ASIA_H0, ASIA_H1 = 0, 6                 # Asian accumulation range hours (UTC)
+KZ_SWEEP_LOOKBACK = 8                   # sweep must be recent (M15 bars)
+KZ_MSS_LOOKBACK   = 12                  # structure shift must be recent (M15 bars)
+DISP_BODY_FRAC    = 0.5                 # displacement bar: body >= 50% of range
+DISP_ATR_MULT     = 1.2                 # ... and range >= 1.2 * ATR(14)
+KZ_SL_BUF_ATR     = 0.10                # stop buffer beyond the sweep wick
+KZ_RR_MIN         = 2.0                 # gold consensus minimum reward:risk
+KZ_RR_CAP         = 3.0                 # cap target at 3R (single-TP proxy for scaling out)
+
+def _minute_of_day(ts):
+    return int(ts[11:13]) * 60 + int(ts[14:16])
+
+def in_killzone(ts):
+    m = _minute_of_day(ts)
+    return any(lo <= m < hi for lo, hi in KZ_WINDOWS)
+
+def killzone_name(ts):
+    m = _minute_of_day(ts)
+    if KZ_WINDOWS[0][0] <= m < KZ_WINDOWS[0][1]:
+        return "LONDON 07-10Z"
+    if KZ_WINDOWS[1][0] <= m < KZ_WINDOWS[1][1]:
+        return "NY 12:30-16Z"
+    return "off"
+
+def session_levels(t, h, l):
+    """Asian-range high/low of the CURRENT day and full prior-day high/low —
+    gold's primary intraday liquidity pools. Uses only bars already in the
+    window (closed data). Returns dict of level -> (price, bar_index) or None."""
+    m = len(t)
+    if m == 0:
+        return {}
+    today = t[-1][:10]
+    asia_hi = asia_lo = pd_hi = pd_lo = None
+    prev_day = None
+    for i in range(m - 1, -1, -1):
+        d = t[i][:10]
+        if d == today:
+            hh = int(t[i][11:13])
+            if ASIA_H0 <= hh < ASIA_H1:
+                if asia_hi is None or h[i] > asia_hi[0]:
+                    asia_hi = (h[i], i)
+                if asia_lo is None or l[i] < asia_lo[0]:
+                    asia_lo = (l[i], i)
+        else:
+            if prev_day is None:
+                prev_day = d
+            if d != prev_day:
+                break
+            if pd_hi is None or h[i] > pd_hi[0]:
+                pd_hi = (h[i], i)
+            if pd_lo is None or l[i] < pd_lo[0]:
+                pd_lo = (l[i], i)
+    return {"asia_hi": asia_hi, "asia_lo": asia_lo, "pd_hi": pd_hi, "pd_lo": pd_lo}
+
+def swept_level(h, l, c, level, side, m, lookback=KZ_SWEEP_LOOKBACK):
+    """Generic recent sweep of a liquidity level. side='high': wick above,
+    body closes back below (buy-side raid). side='low': mirror. Returns
+    (bar_index, wick_extreme) or None. No lookahead."""
+    for j in range(m - 1, max(-1, m - 1 - lookback), -1):
+        if j < 0:
+            break
+        if side == "high" and h[j] > level and c[j] < level:
+            return (j, h[j])
+        if side == "low" and l[j] < level and c[j] > level:
+            return (j, l[j])
+    return None
+
+def displacement_ok(o, h, l, c, a, i):
+    """The community-quantified displacement test: conviction body and an
+    above-average range on the structure-break bar."""
+    if i < 0 or i >= len(c) or math.isnan(a[i]):
+        return False
+    rng = h[i] - l[i]
+    if rng <= 0:
+        return False
+    return abs(c[i] - o[i]) >= DISP_BODY_FRAC * rng and rng >= DISP_ATR_MULT * a[i]
+
+def detect_gold_m15(M15, price, bias, require_bias=True,
+                    entry_mode="ce", sl_buf=KZ_SL_BUF_ATR,
+                    rr_min=KZ_RR_MIN, rr_cap=KZ_RR_CAP, require_pd=True):
+    """XAUUSD M15 killzone setup: (1) killzone time gate, (2) recent sweep of a
+    real liquidity pool (Asian range / prior-day extreme / EQH-EQL), (3) MSS
+    (CHoCH/BOS) in trade direction AFTER the sweep on a displacement bar,
+    (4) entry at 50% of the confirmation FVG (fallback OB), (5) stop beyond
+    the sweep wick + ATR buffer, (6) TP at opposing liquidity, RR >= 2,
+    (7) longs in discount / shorts in premium of the M15 dealing range.
+    Returns sig dict or None. Uses only closed-bar values."""
+    (t15, o15, h15, l15, c15, a15, sh15, sl15) = M15
+    m = len(c15)
+    if m < 30:
+        return None
+    atr15 = a15[-1] if not math.isnan(a15[-1]) else 0.0
+    if atr15 <= 0 or not in_killzone(t15[-1]):
+        return None
+    if not sh15 or not sl15:
+        return None
+
+    sess = session_levels(t15, h15, l15)
+    rng_hi, rng_lo = h15[sh15[-1]], l15[sl15[-1]]
+    eq_mid = 0.5 * (rng_hi + rng_lo)
+
+    def low_side_levels():
+        lv = []
+        for k in ("asia_lo", "pd_lo"):
+            if sess.get(k):
+                lv.append((sess[k][0], k))
+        p = eq_pool(sl15, l15, a15, price, "low")
+        if p:
+            lv.append((p[1], "eql"))
+        return lv
+
+    def high_side_levels():
+        lv = []
+        for k in ("asia_hi", "pd_hi"):
+            if sess.get(k):
+                lv.append((sess[k][0], k))
+        p = eq_pool(sh15, h15, a15, price, "high")
+        if p:
+            lv.append((p[1], "eqh"))
+        return lv
+
+    brk = last_break(sh15, sl15, h15, l15, c15)
+
+    def build(direction):
+        side = "low" if direction == "LONG" else "high"
+        levels = low_side_levels() if direction == "LONG" else high_side_levels()
+        best = None
+        for lvl, src in levels:
+            sw = swept_level(h15, l15, c15, lvl, side, m)
+            if sw and (best is None or sw[0] > best[0][0]):
+                best = (sw, lvl, src)
+        if best is None:
+            return None
+        (sweep_j, sweep_ext), sweep_lvl, sweep_src = best
+        want = "up" if direction == "LONG" else "down"
+        if brk is None or brk[2] != want:
+            return None
+        if brk[0] < sweep_j or brk[0] < m - KZ_MSS_LOOKBACK:
+            return None
+        if not displacement_ok(o15, h15, l15, c15, a15, brk[0]):
+            return None
+        if direction == "LONG":
+            z = bull_fvgs(h15, l15, c15, a15, maxn=1) or bull_obs(o15, h15, l15, c15, a15, price, maxn=1)
+        else:
+            z = bear_fvgs(h15, l15, c15, a15, maxn=1) or bear_obs(o15, h15, l15, c15, a15, price, maxn=1)
+        if not z:
+            return None
+        if z[0][0] < sweep_j:      # zone must be left by the post-sweep displacement leg
+            return None
+        z_lo, z_hi = z[0][1], z[0][2]
+        if entry_mode == "edge":
+            entry = z_hi if direction == "LONG" else z_lo
+        elif entry_mode == "mkt":
+            entry = price                                 # displacement-close market entry
+        else:
+            entry = 0.5 * (z_lo + z_hi)                   # consequent encroachment
+        if direction == "LONG":
+            if require_pd and entry > eq_mid:             # not in discount
+                return None
+            sl_ = min(sweep_ext, z_lo) - sl_buf * atr15
+            tp = liq_above_of(sh15, h15, a15, price)
+            if tp is None or not (tp > entry > sl_):
+                return None
+            risk = entry - sl_
+            if rr_cap > 0:
+                tp = min(tp, entry + rr_cap * risk)       # scale-out proxy
+            rr = (tp - entry) / risk if risk > 0 else 0
+        else:
+            if require_pd and entry < eq_mid:             # not in premium
+                return None
+            sl_ = max(sweep_ext, z_hi) + sl_buf * atr15
+            tp = liq_below_of(sl15, l15, a15, price)
+            if tp is None or not (sl_ > entry > tp):
+                return None
+            risk = sl_ - entry
+            if rr_cap > 0:
+                tp = max(tp, entry - rr_cap * risk)       # scale-out proxy
+            rr = (entry - tp) / risk if risk > 0 else 0
+        if rr < rr_min:
+            return None
+        return {"dir": direction, "entry": entry, "sl": sl_, "tp": tp, "rr": rr,
+                "poi": (z_lo, z_hi), "sweep_bar": sweep_j, "sweep_level": sweep_lvl,
+                "sweep_src": sweep_src, "sweep_ext": sweep_ext, "mss_bar": brk[0]}
+
+    if require_bias:
+        if bias == "BULLISH":
+            return build("LONG")
+        if bias == "BEARISH":
+            return build("SHORT")
+        return None
+    return build("LONG") or build("SHORT")
+
 # ---------- setup detection (HTF POI -> LTF confirmation -> entry/SL/TP) ----------
 def detect_setup(HTF, LTF, price, bias):
     """Walk the state machine for the HTF-bias direction.
@@ -343,12 +544,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true", help="fetch candles from the running MT5 terminal")
     ap.add_argument("--htf-count", type=int, default=160)
-    ap.add_argument("--ltf-count", type=int, default=120)
+    ap.add_argument("--ltf-count", type=int, default=224)   # >2 days of M15: prior-day levels need it
     ap.add_argument("--htf-csv", default="")
     ap.add_argument("--ltf-csv", default="")
     ap.add_argument("--symbol", required=True)
     ap.add_argument("--htf", default="H4")
     ap.add_argument("--ltf", default="M15")
+    ap.add_argument("--ruleset", default="auto", choices=["auto", "doctrine", "gold_m15"],
+                    help="auto = gold_m15 for XAU* symbols on M15, doctrine otherwise")
     ap.add_argument("--seq", type=int, default=0)
     ap.add_argument("--auto-seq", action="store_true", help="auto-increment a per-symbol seq counter file (for the watchdog)")
     ap.add_argument("--ttl", type=int, default=5400)
@@ -486,7 +689,11 @@ def main():
         objs.append(("brk", kind, fmt_time(t[bi], off), lvl, "0", 0, col, "%s %s" % (kind, d)))
 
     # ---- LTF refinement + setup detection (HTF POI -> LTF confirmation) ----
+    ruleset = args.ruleset
+    if ruleset == "auto":
+        ruleset = "gold_m15" if (args.symbol.upper().startswith("XAU") and args.ltf.upper() == "M15") else "doctrine"
     setup_state, sig = ("OBSERVE", None)
+    kz_txt = ""
     ltf_loaded = None
     if args.live:
         ltf_loaded = load_live(args.symbol, args.ltf, args.ltf_count)
@@ -503,11 +710,31 @@ def main():
                 objs.append(("ltf_fvg_b_%d" % n, "FVG", fmt_time(t2[i - 2], off), ghi, "0", glo, "slate", "%s FVG" % args.ltf))
             setup_state, sig = detect_setup((t, o, h, l, c, a, sh, sl),
                                             (t2, o2, h2, l2, c2, aa2, sh2, sl2), price, bias)
+            if ruleset == "gold_m15":
+                # session liquidity map: Asian range box + prior-day extremes
+                sess = session_levels(t2, h2, l2)
+                if sess.get("asia_hi") and sess.get("asia_lo"):
+                    ah, al = sess["asia_hi"], sess["asia_lo"]
+                    ti = min(ah[1], al[1])
+                    objs.append(("asia_rng", "ZONE", fmt_time(t2[ti], off), ah[0], "0", al[0], "slate", "Asia range"))
+                if sess.get("pd_hi"):
+                    objs.append(("pdh", "LIQ", fmt_time(t2[sess["pd_hi"][1]], off), sess["pd_hi"][0], "0", 0, "gold", "PDH liq"))
+                if sess.get("pd_lo"):
+                    objs.append(("pdl", "LIQ", fmt_time(t2[sess["pd_lo"][1]], off), sess["pd_lo"][0], "0", 0, "gold", "PDL liq"))
+                kz_txt = killzone_name(t2[-1])
+                gsig = detect_gold_m15((t2, o2, h2, l2, c2, aa2, sh2, sl2), price, bias)
+                if gsig:
+                    setup_state, sig = "KZ_CONFIRMED", gsig
+                    objs.append(("kz_sweep", "SWEEP", fmt_time(t2[gsig["sweep_bar"]], off),
+                                 gsig["sweep_ext"], "0", 0, "magenta",
+                                 "SWEEP %s" % gsig["sweep_src"]))
     else:
         setup_state = "HTF_ARMED" if bias in ("BULLISH", "BEARISH") else "OBSERVE"
 
+    CONFIRMED_STATES = ("LTF_CONFIRMED", "KZ_CONFIRMED")
+
     # draw entry/SL/TP when a setup is confirmed (reuse LIQ/TARGET kinds -> no indicator change)
-    if sig and setup_state == "LTF_CONFIRMED":
+    if sig and setup_state in CONFIRMED_STATES:
         rt = fmt_time(t[-1], off)
         objs.append(("sig_entry", "LIQ", rt, sig["entry"], "0", 0, "dodger", "ENTRY %s" % sig["dir"]))
         objs.append(("sig_sl", "LIQ", rt, sig["sl"], "0", 0, "crimson", "SL"))
@@ -524,7 +751,7 @@ def main():
         rtv = fmt_time(t[-1], off)
         atr_h = a[-1] if (a and not math.isnan(a[-1])) else 0.0
         BUF, RR_MIN = 0.25 * atr_h, 1.5
-        confirmed = bool(sig and setup_state == "LTF_CONFIRMED")
+        confirmed = bool(sig and setup_state in CONFIRMED_STATES)
 
         def emit_poss(direction, entry, sl_, tp):
             if confirmed:                      # the validated state machine supersedes a candidate
@@ -625,8 +852,12 @@ def main():
         ("Risk", "0%% / eq $%s" % (args.equity or "n/a")),
         ("Ticket", args.ticket),
     ]
-    if sig and setup_state == "LTF_CONFIRMED":
+    if kz_txt:
+        panel.insert(5, ("Killzone", kz_txt if kz_txt != "off" else "off - no entries"))
+    if sig and setup_state in CONFIRMED_STATES:
         panel.append(("Trade", "e%s sl%s tp%s R%.1f" % (px(sig["entry"]), px(sig["sl"]), px(sig["tp"]), sig["rr"])))
+        if setup_state == "KZ_CONFIRMED":
+            panel.append(("Sweep", "%s swept @%s" % (sig.get("sweep_src", "?"), px(sig.get("sweep_level", 0)))))
     if viol_txt != "none":
         panel.append(("Violations", viol_txt))
     if poss_panel:
@@ -704,7 +935,7 @@ def main():
         prev_poss = _st.get("poss_key", "")
     except (OSError, ValueError):
         pass
-    sig_key = ("%s:%s" % (sig["dir"], px(sig["entry"]))) if (setup_state == "LTF_CONFIRMED" and sig) else ""
+    sig_key = ("%s:%s" % (sig["dir"], px(sig["entry"]))) if (setup_state in CONFIRMED_STATES and sig) else ""
     armed_new = bool(sig_key) and sig_key != prev_key
     if armed_new:
         armed_seq += 1
@@ -729,7 +960,7 @@ def main():
 
     print("WROTE %s" % out)
     print("seq=%d  bias=%s  state=%s  objects=%d  price=%.2f" % (args.seq, bias, setup_state, len(objs), price))
-    if sig and setup_state == "LTF_CONFIRMED":
+    if sig and setup_state in CONFIRMED_STATES:
         print("SETUP %s  entry=%.2f sl=%.2f tp=%.2f rr=%.2f  armed_new=%s seq=%d"
               % (sig["dir"], sig["entry"], sig["sl"], sig["tp"], sig["rr"], armed_new, armed_seq))
     print("active_poi=%s" % poi_txt)
