@@ -1,0 +1,4 @@
+@echo off
+REM SMC COMMAND DESK - 5-minute dashboard watchdog (OS-level, no Claude tokens).
+REM Refreshes the on-chart command center from live candles every run.
+"C:\Python313\python.exe" "C:\Users\Sanique Richards\Documents\Homework Heroes\Pokemon\smc-command-desk\smc_map.py" --live --auto-seq --symbol XAUUSD --htf H4 --ltf M15 --ttl 1200 --validation FAIL --state OBSERVE --desk-mode "VALIDATE - observe-only" --news-file "C:\Users\Sanique Richards\AppData\Roaming\MetaQuotes\Terminal\Common\Files\smc_news_XAUUSD.txt" --ticket-file "C:\Users\Sanique Richards\AppData\Roaming\MetaQuotes\Terminal\Common\Files\smc_ticket_XAUUSD.txt" --next-wake "auto (5-min watchdog)" --out-dir "C:\Users\Sanique Richards\AppData\Roaming\MetaQuotes\Terminal\Common\Files" >> "C:\Users\Sanique Richards\Documents\Homework Heroes\Pokemon\smc-command-desk\watchdog.log" 2>&1

@@ -1,0 +1,7 @@
+# market data (re-fetch with fetch_history.py)
+*.csv
+# runtime artifacts
+*.log
+__pycache__/
+*.pyc
+*.ex5
