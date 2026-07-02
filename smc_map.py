@@ -275,7 +275,8 @@ KZ_MSS_LOOKBACK   = 12                  # structure shift must be recent (M15 ba
 DISP_BODY_FRAC    = 0.5                 # displacement bar: body >= 50% of range
 DISP_ATR_MULT     = 1.2                 # ... and range >= 1.2 * ATR(14)
 KZ_SL_BUF_ATR     = 0.10                # stop buffer beyond the sweep wick
-KZ_RR_MIN         = 2.0                 # gold consensus minimum reward:risk
+KZ_RR_MIN         = 1.5                 # minimum reward:risk (validated: 1.5 beat the
+                                        # community-quoted 2.0 on 6.5y of gold M15)
 KZ_RR_CAP         = 3.0                 # cap target at 3R (single-TP proxy for scaling out)
 
 def _minute_of_day(ts):
@@ -347,7 +348,7 @@ def displacement_ok(o, h, l, c, a, i):
     return abs(c[i] - o[i]) >= DISP_BODY_FRAC * rng and rng >= DISP_ATR_MULT * a[i]
 
 def detect_gold_m15(M15, price, bias, require_bias=True,
-                    entry_mode="ce", sl_buf=KZ_SL_BUF_ATR,
+                    entry_mode="edge", sl_buf=KZ_SL_BUF_ATR,
                     rr_min=KZ_RR_MIN, rr_cap=KZ_RR_CAP, require_pd=True):
     """XAUUSD M15 killzone setup: (1) killzone time gate, (2) recent sweep of a
     real liquidity pool (Asian range / prior-day extreme / EQH-EQL), (3) MSS
@@ -419,12 +420,12 @@ def detect_gold_m15(M15, price, bias, require_bias=True,
         if z[0][0] < sweep_j:      # zone must be left by the post-sweep displacement leg
             return None
         z_lo, z_hi = z[0][1], z[0][2]
-        if entry_mode == "edge":
-            entry = z_hi if direction == "LONG" else z_lo
+        if entry_mode == "ce":
+            entry = 0.5 * (z_lo + z_hi)                   # consequent encroachment
         elif entry_mode == "mkt":
             entry = price                                 # displacement-close market entry
-        else:
-            entry = 0.5 * (z_lo + z_hi)                   # consequent encroachment
+        else:                                             # "edge" (validated default)
+            entry = z_hi if direction == "LONG" else z_lo
         if direction == "LONG":
             if require_pd and entry > eq_mid:             # not in discount
                 return None

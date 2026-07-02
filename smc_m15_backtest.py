@@ -29,7 +29,10 @@ MODE      = sys.argv[6] if len(sys.argv) > 6 else "doctrine"   # doctrine | scal
 FILTERS   = set((sys.argv[7] if len(sys.argv) > 7 else "").split(",")) - {""}
 # scalp-mode filters: sess (London+NY 07-21 UTC), disp (displacement break bar),
 #                     sweep (liquidity sweep within 20 bars first), trail (BE@1R + 2xATR trail)
-# gold-mode  filters: trail (same management), nobias (drop the H4-bias alignment gate)
+# gold-mode  filters: trail (BE@1R + 2xATR trail), nobias (drop the H4-bias alignment gate),
+#                     ce/mkt (entry style; default = zone edge), rr20/cap2/nocap (RR gates),
+#                     buf25 (wider stop), nopd (drop premium/discount),
+#                     tuethu (Tue-Thu only, silver-bullet advice)
 
 H4_BARS   = 160     # H4 context window given to detect_setup (matches live --htf-count)
 M15_BARS  = 224     # M15 window (matches live --ltf-count; >2 days for prior-day levels)
@@ -136,7 +139,12 @@ def detect_scalp(M15, price, bias):
             return None
         return {"dir": "SHORT", "entry": entry, "sl": sl_, "tp": tp, "rr": rr}
 
+import datetime as _dt
 def in_session(ts):
+    if "tuethu" in FILTERS:                               # silver-bullet advice: skip Mon/Fri
+        wd = _dt.date(int(ts[:4]), int(ts[5:7]), int(ts[8:10])).weekday()
+        if wd in (0, 4):
+            return False
     if "sess" not in FILTERS:
         return True
     hh = int(ts[11:13])
@@ -207,10 +215,10 @@ for i in range(WARMUP, n-1):
     if MODE=="gold":
         sig = sm.detect_gold_m15((M15[0],M15[1],M15[2],M15[3],M15[4],a15,sh15,sl15),
                                  c[i], bias, require_bias=("nobias" not in FILTERS),
-                                 entry_mode=("edge" if "edge" in FILTERS else
-                                             ("mkt" if "mkt" in FILTERS else "ce")),
+                                 entry_mode=("ce" if "ce" in FILTERS else
+                                             ("mkt" if "mkt" in FILTERS else "edge")),
                                  sl_buf=(0.25 if "buf25" in FILTERS else sm.KZ_SL_BUF_ATR),
-                                 rr_min=(1.5 if "rr15" in FILTERS else sm.KZ_RR_MIN),
+                                 rr_min=(2.0 if "rr20" in FILTERS else sm.KZ_RR_MIN),
                                  rr_cap=(2.0 if "cap2" in FILTERS else
                                          (0.0 if "nocap" in FILTERS else sm.KZ_RR_CAP)),
                                  require_pd=("nopd" not in FILTERS))
